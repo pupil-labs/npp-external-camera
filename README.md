@@ -4,9 +4,9 @@ External camera plugin. Loads an external camera video and presents it in sync w
 
 Requires a `.mov` format video with `.time` file that includes timestamps for each frame. Shows the external view in a Picture-in-Picture (PiP) window that can be resized, rotated, moved around, or changed in transparency. Also adds frame scrubbing capabilities, accessible with shortcuts (`Shift + H` / `Shift + L`) and the posibility to dock it to the main window to see it side-by-side with the scene camera.
 
-::: tip
-We will publish a guide on how to generate the `.time` file while recording. For now, you can use the external_camera_manual_sync.py plugin to manually sync your external camera video and generate the `.time` file.
-:::
+> [!TIP]
+> We will publish a guide on how to generate the `.time` file while recording. For now, you can use the external_camera_manual_sync.py plugin to manually sync your external camera video and generate the `.time` file.
+> For now, you can use the [external_camera_manual_sync.py](https://github.com/pupil-labs/npp-external-camera-manual-sync).
 
 
 ## Installation
