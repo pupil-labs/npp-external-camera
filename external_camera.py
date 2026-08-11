@@ -18,7 +18,7 @@ import pupil_labs.video as plv
 from pupil_labs.neon_player import Plugin, action
 from pupil_labs.neon_player.ui import ListPropertyAppenderAction
 from pupil_labs.neon_player.utilities import qimage_from_frame
-from pupil_labs.neon_recording import NeonRecording
+from pupil_labs.neon_recording import NeonRecording, match_ts
 from PySide6.QtCore import QObject, QRectF, Qt, Signal
 from PySide6.QtGui import (
     QColor,
@@ -274,6 +274,26 @@ class ExternalCamera(PersistentPropertiesMixin, QObject):
                 )
         else:
             self.close_dock(main_window)
+
+    def sample(
+        self, timestamps_ns: list[int] | np.ndarray, method: str = "backward"
+    ) -> list[Any]:
+
+        indices = match_ts(timestamps_ns, self.timestamps, method)
+
+        frames = []
+        for idx in indices:
+            idx = int(idx)
+            if idx != self._last_idx:
+                try:
+                    self._last_frame = self.reader[idx]
+                    self._last_idx = idx
+                except Exception:
+                    logger.exception(f"ExternalCamera: Error reading frame {idx}")
+                    self._last_frame = None
+            frames.append(self._last_frame)
+
+        return frames
 
     def current_image(self, time_in_recording: int) -> tuple[int, Any] | None:
         if self.reader is None or len(self.timestamps) == 0:
