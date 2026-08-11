@@ -3,19 +3,23 @@
 # dependencies = [
 # ]
 # ///
+import contextlib
 import functools
 import logging
 import math
-from enum import Flag, auto
+from collections.abc import Callable
+from enum import Flag, StrEnum, auto
 from pathlib import Path
 from typing import Any
 
+import av
 import numpy as np
 import pupil_labs.video as plv
 from pupil_labs.neon_player import Plugin, action
+from pupil_labs.neon_player.ui import ListPropertyAppenderAction
 from pupil_labs.neon_player.utilities import qimage_from_frame
 from pupil_labs.neon_recording import NeonRecording
-from PySide6.QtCore import QRectF, Qt
+from PySide6.QtCore import QObject, QRectF, Qt, Signal
 from PySide6.QtGui import (
     QColor,
     QIcon,
@@ -26,16 +30,41 @@ from PySide6.QtGui import (
     QShortcut,
     QTransform,
 )
-from PySide6.QtWidgets import QDockWidget, QLabel, QSizePolicy
-from qt_property_widgets.utilities import action_params, property_params
+from PySide6.QtWidgets import QDockWidget, QLabel, QMessageBox, QSizePolicy
+from qt_property_widgets.utilities import (
+    PersistentPropertiesMixin,
+    action_params,
+    property_params,
+)
+from qt_property_widgets.widgets import DynamicComboWidget
 
 logger = logging.getLogger(__name__)
+VIDEO_SUFFIXES = (".mov", ".mp4")
+OverlayPainter = Callable[[QPainter, float, float, int, str], None]
+
+
+class DockLabel(QLabel):
+    def __init__(self, camera: "ExternalCamera", plugin: "ExternalCameraPlugin"):
+        super().__init__()
+        self.camera = camera
+        self.plugin = plugin
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self.plugin and self.camera:
+            self.plugin._render_docked(self.camera, self.plugin._last_rendered_time)
 
 
 class ModifyDirection(Flag):
     NONE = 0
     CORNER = auto()
     MOVE = auto()
+
+
+class DisplayMode(StrEnum):
+    OFF = "Off"
+    PIP = "Picture-in-Picture"
+    DOCKED = "Docked Window"
 
 
 def patch_pl_video():
@@ -54,9 +83,7 @@ def patch_pl_video():
 
         @functools.wraps(old_func)
         def patched_func(self):
-            if str(self.source).lower().endswith((".mov", ".mp4")):
-                import av
-
+            if str(self.source).lower().endswith(VIDEO_SUFFIXES):
                 container = av.open(str(self.source), format=None)
                 for stream in container.streams.video:
                     stream.thread_type = "FRAME"
@@ -72,74 +99,20 @@ def patch_pl_video():
         logger.info(
             "ExternalCameraPlugin: Successfully patched plv.Reader to support .mov and .mp4 files."
         )
-    except Exception as e:
-        logger.exception(f"ExternalCameraPlugin: Failed to patch plv.Reader: {e}")
+    except Exception:
+        logger.exception("ExternalCameraPlugin: Failed to patch plv.Reader")
 
 
 patch_pl_video()
 
 
-class SimplifiedExternalCamera:
-    def __init__(self, mov_path, time_path):
-        self.reader = plv.Reader(str(mov_path), stream="video")
-        self.timestamps = np.loadtxt(str(time_path), dtype=np.int64)
+class ExternalCamera(PersistentPropertiesMixin, QObject):
+    changed = Signal()
 
-        diffs = np.diff(self.timestamps)
-        self.frame_duration_ns = int(np.median(diffs)) if len(diffs) > 0 else 5_000_000
-
-        self._last_idx = -1
-        self._last_frame = None
-
-    def sample(
-        self, timestamps_ns: list[int] | np.ndarray, method: str = "backward"
-    ) -> list[Any]:
-        if len(timestamps_ns) == 0:
-            return []
-
-        target_ts = timestamps_ns[0]
-        idx = np.searchsorted(self.timestamps, target_ts)
-        if idx >= len(self.timestamps):
-            idx = len(self.timestamps) - 1
-        elif idx > 0 and method == "backward" and self.timestamps[idx] > target_ts:
-            idx = max(0, idx - 1)
-
-        if idx != self._last_idx:
-            try:
-                frame = self.reader[idx]
-
-                class MockSample:
-                    def __init__(self, av_frame):
-                        try:
-                            self.bgr = av_frame.to_ndarray(format="bgr24")
-                        except TypeError:
-                            try:
-                                self.bgr = av_frame.reformat(
-                                    format="bgr24"
-                                ).to_ndarray()
-                            except Exception:
-                                rgb_array = np.array(av_frame.to_image())
-                                self.bgr = rgb_array[..., ::-1].copy()
-
-                self._last_frame = MockSample(frame)
-                self._last_idx = idx
-            except Exception as e:
-                logger.exception(f"ExternalCamera: Error reading frame {idx}: {e}")
-                return []
-
-        return [self._last_frame] if self._last_frame else []
-
-    def __len__(self):
-        return len(self.timestamps)
-
-
-class ExternalCameraPlugin(Plugin):
-    label = "External Camera"
-
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
-        self._render_external_camera = True
-        self._undocked = False
-
+        self._video_path: str = ""
+        self._display_mode = DisplayMode.DOCKED
         self._alpha = 1.0
         self._scale = 1.0
         self._rotation = 0.0
@@ -148,366 +121,76 @@ class ExternalCameraPlugin(Plugin):
         self._anchor_right = True
         self._anchor_bottom = True
 
-        self._mouse_mode = ModifyDirection.NONE
-        self._drag_start_pos = None
-        self._start_geometry = QRectF()
-        self._start_rotation = 0.0
-        self._start_scale = 1.0
-        self._last_rect = None
-        self._last_rendered_time = 0
+        self.reader: plv.Reader | None = None
+        self.timestamps: np.ndarray = np.zeros(0, dtype=np.int64)
+        self.frame_duration_ns = 5_000_000
+        self.last_rect: QRectF | None = None
 
-    def on_recording_loaded(self, recording: NeonRecording) -> None:
+        self._last_idx = -1
+        self._last_frame: plv.VideoFrame | None = None
+        self._dock: QDockWidget | None = None
+        self._label: QLabel | None = None
+        self._dock_state: tuple | None = None
 
-        rec_path = Path(self.recording._rec_dir)
-        media_files = sorted(rec_path.glob("recording_*.mov")) + sorted(
-            rec_path.glob("recording_*.mp4")
-        )
-        time_files = [f.with_suffix(".time") for f in media_files]
+        self._adopt_first_detected()
 
-        valid_pairs = [
-            (m, t) for m, t in zip(media_files, time_files, strict=False) if t.exists()
-        ]
-
-        if not valid_pairs:
-            logger.info(
-                "ExternalCameraPlugin: No recording_*.mov/mp4/time pairs found in this recording."
-            )
+    def _adopt_first_detected(self) -> None:
+        plugin = Plugin.get_instance_by_name("ExternalCameraPlugin")
+        if plugin is None or plugin.recording is None:
             return
 
-        try:
-            mov_path, time_path = valid_pairs[0]
-            recording.external_camera = SimplifiedExternalCamera(mov_path, time_path)
-            self._frame_duration_ns = recording.external_camera.frame_duration_ns
-            logger.info(
-                f"ExternalCameraPlugin: Loaded stream from {mov_path.name} with median frame duration {self._frame_duration_ns}ns"
-            )
-        except Exception as e:
-            logger.exception(
-                f"ExternalCameraPlugin: Failed to initialize simplified stream: {e}"
-            )
-
-        vw = self.app.main_window.video_widget
-        try:
-            vw.mouse_pressed.disconnect(self.on_mouse_pressed)
-            vw.mouse_moved.disconnect(self.on_mouse_moved)
-            vw.mouse_released.disconnect(self.on_mouse_released)
-        except Exception:  # ruff: ignore[blind-except, try-except-pass]
-            pass
-
-        vw.mouse_pressed.connect(self.on_mouse_pressed)
-        vw.mouse_moved.connect(self.on_mouse_moved)
-        vw.mouse_released.connect(self.on_mouse_released)
-
-        self._shortcut_h = QShortcut(QKeySequence("Shift+H"), self.app.main_window)
-        self._shortcut_h.activated.connect(self.previous_frame)
-
-        self._shortcut_l = QShortcut(QKeySequence("Shift+L"), self.app.main_window)
-        self._shortcut_l.activated.connect(self.next_frame)
-
-        if self._undocked:
-            self._setup_dock_widget()
-
-    def on_disabled(self) -> None:
-        self._remove_dock_widget()
-
-        try:
-            vw = self.app.main_window.video_widget
-            vw.mouse_pressed.disconnect(self.on_mouse_pressed)
-            vw.mouse_moved.disconnect(self.on_mouse_moved)
-            vw.mouse_released.disconnect(self.on_mouse_released)
-        except Exception:  # ruff: ignore[blind-except, try-except-pass]
-            pass
-
-        if getattr(self, "_shortcut_h", None):
-            self._shortcut_h.setEnabled(False)
-            self._shortcut_h.deleteLater()
-            self._shortcut_h = None
-
-        if getattr(self, "_shortcut_l", None):
-            self._shortcut_l.setEnabled(False)
-            self._shortcut_l.deleteLater()
-            self._shortcut_l = None
-
-    def _setup_dock_widget(self):
-        if not hasattr(self, "app") or not getattr(self.app, "main_window", None):
+        detected = plugin.detected_videos()
+        if detected is None:
             return
-        if hasattr(self, "_dock") and self._dock:
-            return
-
-        self._dock = QDockWidget("External Camera", self.app.main_window)
-        self._label = QLabel()
-        self._label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._label.setSizePolicy(
-            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored
-        )
-        self._dock.setWidget(self._label)
-        self.app.main_window.addDockWidget(
-            Qt.DockWidgetArea.RightDockWidgetArea, self._dock
-        )
-
-    def _remove_dock_widget(self):
-        if hasattr(self, "_dock") and self._dock:
-            self.app.main_window.removeDockWidget(self._dock)
-            self._dock.deleteLater()
-            self._dock = None
-            self._label = None
-
-    def render(self, painter: QPainter, time_in_recording: int) -> None:
-        self._last_rendered_time = time_in_recording
-        if not self._render_external_camera:
-            return
-
-        if not hasattr(self.recording, "external_camera"):
-            return
-
-        samples = self.external_camera.sample([time_in_recording])
-        if not samples:
-            return
-
-        sample = samples[0]
-        if sample is None or not hasattr(sample, "bgr"):
-            return
-
-        img = qimage_from_frame(sample.bgr)
-        if not img:
-            return
-
-        if self._undocked:
-            if hasattr(self, "_label") and self._label:
-                pixmap = QPixmap.fromImage(img)
-                scaled_pixmap = pixmap.scaled(
-                    self._label.size(),
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation,
-                )
-                self._label.setPixmap(scaled_pixmap)
-            return
-
-        sw, sh = self.recording.scene.width, self.recording.scene.height
-        base_th = sh / 3.0
-        th = base_th * self._scale
-        tw = th * (img.width() / img.height())
-
-        x = (
-            (sw - tw - self._offset_x * sw)
-            if self._anchor_right
-            else (self._offset_x * sw)
-        )
-        y = (
-            (sh - th - self._offset_y * sh)
-            if self._anchor_bottom
-            else (self._offset_y * sh)
-        )
-
-        rect = QRectF(x, y, tw, th)
-        self._last_rect = rect
-
-        painter.save()
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-        painter.setOpacity(self._alpha)
-
-        if self._rotation != 0.0:
-            cx, cy = rect.center().x(), rect.center().y()
-            painter.translate(cx, cy)
-            painter.rotate(self._rotation)
-            painter.translate(-cx, -cy)
-
-        painter.drawImage(rect, img)
-
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        if self._mouse_mode != ModifyDirection.NONE:
-            painter.setPen(QPen(QColor("#6D7BE0"), 4))
-            painter.drawRect(rect)
+        if detected:
+            self.video_path = str(detected[0])
         else:
-            painter.setPen(QPen(QColor(255, 255, 255), 2))
-            painter.drawRect(rect)
-
-        painter.restore()
-
-    def _get_transform(self) -> QTransform:
-        if not self._last_rect:
-            return QTransform()
-        t = QTransform()
-        cx, cy = self._last_rect.center().x(), self._last_rect.center().y()
-        t.translate(cx, cy)
-        t.rotate(self._rotation)
-        t.translate(-cx, -cy)
-        return t
-
-    def on_mouse_pressed(self, event):
-        if not self._render_external_camera or self._undocked or not self._last_rect:
-            return
-
-        vw = self.app.main_window.video_widget
-        pos = (
-            vw.map_point(event.position())
-            if hasattr(event, "position")
-            else vw.map_point(event.pos())
-        )
-
-        transform = self._get_transform()
-        poly = transform.map(self._last_rect)
-
-        if poly.containsPoint(pos, Qt.FillRule.WindingFill):
-            self._drag_start_pos = pos
-            self._start_geometry = self._last_rect
-            self._start_rotation = self._rotation
-            self._start_scale = self._scale
-            self.on_hover(event)
-            event.accept()
-
-    def on_mouse_moved(self, event):
-        if event.buttons() == Qt.MouseButton.LeftButton:
-            self.on_drag(event)
-        else:
-            self.on_hover(event)
-
-    def on_mouse_released(self, event):
-        self._mouse_mode = ModifyDirection.NONE
-        self._drag_start_pos = None
-        self.app.main_window.video_widget.unsetCursor()
-        self.changed.emit()
-
-    def on_hover(self, event):
-        if not self._render_external_camera or self._undocked or not self._last_rect:
-            return
-
-        vw = self.app.main_window.video_widget
-        pos = (
-            vw.map_point(event.position())
-            if hasattr(event, "position")
-            else vw.map_point(event.pos())
-        )
-        margin = max(30, self._last_rect.width() * 0.15)
-
-        transform = self._get_transform()
-        poly = transform.map(self._last_rect)
-
-        if poly.containsPoint(pos, Qt.FillRule.WindingFill):
-            corners = [
-                self._last_rect.topLeft(),
-                self._last_rect.topRight(),
-                self._last_rect.bottomLeft(),
-                self._last_rect.bottomRight(),
-            ]
-
-            is_near_corner = False
-            for corner in corners:
-                corner_screen = transform.map(corner)
-                dist = math.hypot(
-                    pos.x() - corner_screen.x(), pos.y() - corner_screen.y()
-                )
-                if dist < margin:
-                    is_near_corner = True
-                    break
-
-            if is_near_corner:
-                self._mouse_mode = ModifyDirection.CORNER
-                vw.setCursor(Qt.CursorShape.CrossCursor)
-            else:
-                self._mouse_mode = ModifyDirection.MOVE
-                vw.setCursor(Qt.CursorShape.SizeAllCursor)
-        else:
-            self._mouse_mode = ModifyDirection.NONE
-            vw.unsetCursor()
-        vw.update()
-
-    def on_drag(self, event):
-        if (
-            self._mouse_mode == ModifyDirection.NONE
-            or not self._drag_start_pos
-            or self._undocked
-        ):
-            return
-
-        vw = self.app.main_window.video_widget
-        pos = (
-            vw.map_point(event.position())
-            if hasattr(event, "position")
-            else vw.map_point(event.pos())
-        )
-
-        dx = pos.x() - self._drag_start_pos.x()
-        dy = pos.y() - self._drag_start_pos.y()
-        sw, sh = self.recording.scene.width, self.recording.scene.height
-
-        if self._mouse_mode == ModifyDirection.MOVE:
-            if self._anchor_right:
-                self._offset_x -= dx / sw
-            else:
-                self._offset_x += dx / sw
-
-            if self._anchor_bottom:
-                self._offset_y -= dy / sh
-            else:
-                self._offset_y += dy / sh
-
-            self._drag_start_pos = pos
-
-        elif self._mouse_mode == ModifyDirection.CORNER:
-            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
-                cx = self._start_geometry.center().x()
-                cy = self._start_geometry.center().y()
-                dx1 = self._drag_start_pos.x() - cx
-                dy1 = self._drag_start_pos.y() - cy
-                dx2 = pos.x() - cx
-                dy2 = pos.y() - cy
-
-                angle1 = math.degrees(math.atan2(dy1, dx1))
-                angle2 = math.degrees(math.atan2(dy2, dx2))
-
-                diff = angle2 - angle1
-                diff = (diff + 180) % 360 - 180
-
-                new_rot = self._start_rotation + diff
-                self._rotation = (new_rot + 180) % 360 - 180
-            else:
-                t = QTransform()
-                cx, cy = (
-                    self._start_geometry.center().x(),
-                    self._start_geometry.center().y(),
-                )
-                t.translate(cx, cy)
-                t.rotate(self._start_rotation)
-                t.translate(-cx, -cy)
-
-                inv_t, invertible = t.inverted()
-                if invertible:
-                    local_pos = inv_t.map(pos)
-                    local_start = inv_t.map(self._drag_start_pos)
-
-                    dist_start = math.hypot(local_start.x() - cx, local_start.y() - cy)
-                    dist_current = math.hypot(local_pos.x() - cx, local_pos.y() - cy)
-
-                    if dist_start > 0:
-                        scale_factor = dist_current / dist_start
-                        self._scale = max(0.1, self._start_scale * scale_factor)
-
-        self.changed.emit()
-        vw.update()
+            QMessageBox.warning(
+                plugin.app.main_window,
+                "No External Cameras",
+                "No recording_*.mov/.mp4 with a matching .time file was found.",
+            )
 
     @property
-    def render_external_camera(self) -> bool:
-        return self._render_external_camera
-
-    @render_external_camera.setter
-    def render_external_camera(self, value: bool) -> None:
-        self._render_external_camera = value
-        self.changed.emit()
+    @property_params(widget=None)
+    def name(self) -> str:
+        return Path(self._video_path).name if self._video_path else "(no video)"
 
     @property
-    @property_params(label="Undock Window")
-    def undocked(self) -> bool:
-        return self._undocked
+    @property_params(
+        label="Video",
+        widget=DynamicComboWidget,
+        options_source="_video_options",
+        options_changed_signal="changed",
+    )
+    def video_path(self) -> str:
+        return self._video_path
 
-    @undocked.setter
-    def undocked(self, value: bool) -> None:
-        self._undocked = value
-        if self._undocked:
-            self._setup_dock_widget()
-        else:
-            self._remove_dock_widget()
+    @video_path.setter
+    def video_path(self, value: str) -> None:
+        value = str(value)
+        if value == self._video_path:
+            return
+        self._video_path = value
+        self.open()
+        self.changed.emit()
+
+    def _video_options(self) -> list[tuple[str, str]]:
+        plugin = Plugin.get_instance_by_name("ExternalCameraPlugin")
+        videos = (plugin.detected_videos() or []) if plugin else []
+        return [(v.name, str(v)) for v in videos]
+
+    @property
+    @property_params(label="Display")
+    def display_mode(self) -> DisplayMode:
+        return self._display_mode
+
+    @display_mode.setter
+    def display_mode(self, value: DisplayMode) -> None:
+        self._display_mode = DisplayMode(value)
+        plugin = Plugin.get_instance_by_name("ExternalCameraPlugin")
+        if plugin is not None:
+            self.sync_dock(plugin.app.main_window)
         self.changed.emit()
 
     @property
@@ -540,40 +223,545 @@ class ExternalCameraPlugin(Plugin):
         self._rotation = float(value)
         self.changed.emit()
 
-    @action
-    @action_params(
-        compact=True,
-        icon=QIcon.fromTheme("media-seek-backward"),
+    def open(self) -> None:
+        self.reader = None
+        self.timestamps = np.zeros(0, dtype=np.int64)
+        self._last_idx = -1
+        self._last_frame = None
+
+        if not self._video_path:
+            return
+
+        mov_path = Path(self._video_path)
+        time_path = mov_path.with_suffix(".time")
+        if not mov_path.exists() or not time_path.exists():
+            return
+
+        try:
+            self.reader = plv.Reader(str(mov_path), stream="video")
+            self.timestamps = np.loadtxt(str(time_path), dtype=np.int64)
+            diffs = np.diff(self.timestamps)
+            self.frame_duration_ns = (
+                int(np.median(diffs)) if len(diffs) > 0 else 5_000_000
+            )
+            logger.info(
+                f"ExternalCamera: Opened {mov_path.name} (frame duration: {self.frame_duration_ns}ns)"
+            )
+        except Exception:
+            logger.exception(f"ExternalCamera: Failed to open {mov_path.name}")
+            self.reader = None
+
+    def close_dock(self, main_window) -> None:
+        if self._dock:
+            main_window.removeDockWidget(self._dock)
+            self._dock.deleteLater()
+            self._dock = None
+            self._label = None
+
+    def sync_dock(self, main_window) -> None:
+        if self._display_mode == DisplayMode.DOCKED:
+            if not self._dock:
+                self._dock = QDockWidget("External Camera", main_window)
+                plugin = Plugin.get_instance_by_name("ExternalCameraPlugin")
+                self._label = DockLabel(self, plugin)
+                self._label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                self._label.setSizePolicy(
+                    QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored
+                )
+                self._dock.setWidget(self._label)
+                main_window.addDockWidget(
+                    Qt.DockWidgetArea.RightDockWidgetArea, self._dock
+                )
+        else:
+            self.close_dock(main_window)
+
+    def current_image(self, time_in_recording: int) -> tuple[int, Any] | None:
+        if self.reader is None or len(self.timestamps) == 0:
+            return None
+
+        idx = np.searchsorted(self.timestamps, time_in_recording)
+        if idx >= len(self.timestamps):
+            idx = len(self.timestamps) - 1
+        elif idx > 0 and self.timestamps[idx] > time_in_recording:
+            idx -= 1
+
+        if idx != self._last_idx:
+            try:
+                self._last_frame = self.reader[idx]
+                self._last_idx = idx
+            except Exception:
+                logger.exception(f"ExternalCamera: Error reading frame {idx}")
+                return None
+
+        if self._last_frame is None:
+            return None
+
+        img = qimage_from_frame(self._last_frame.bgr)
+        if not img:
+            return None
+
+        return idx, img
+
+    @property
+    @property_params(widget=None)
+    def offset_x(self) -> float:
+        return self._offset_x
+
+    @offset_x.setter
+    def offset_x(self, value: float) -> None:
+        self._offset_x = value
+
+    @property
+    @property_params(widget=None)
+    def offset_y(self) -> float:
+        return self._offset_y
+
+    @offset_y.setter
+    def offset_y(self, value: float) -> None:
+        self._offset_y = value
+
+    @property
+    @property_params(widget=None)
+    def anchor_right(self) -> bool:
+        return self._anchor_right
+
+    @property
+    @property_params(widget=None)
+    def anchor_bottom(self) -> bool:
+        return self._anchor_bottom
+
+
+class ExternalCameraPlugin(Plugin):
+    label = "External Camera"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._cameras: list[ExternalCamera] = []
+        self._detected_videos: list[Path] | None = None
+        self._overlays: list[OverlayPainter] = []
+
+        self._mouse_mode = ModifyDirection.NONE
+        self._drag_start_pos = None
+        self._start_geometry = QRectF()
+        self._start_rotation = 0.0
+        self._start_scale = 1.0
+        self._drag_camera: ExternalCamera | None = None
+        self._last_rendered_time = 0
+        self._signals_connected = False
+
+        self._shortcut_h: QShortcut | None = None
+        self._shortcut_l: QShortcut | None = None
+
+        self.header_action = ListPropertyAppenderAction("cameras", "+ Add Camera")
+
+    @property
+    @property_params(
+        primary=True,
+        prevent_add=True,
+        item_params={"label_field": "name"},
     )
+    def cameras(self) -> list[ExternalCamera]:
+        return self._cameras
+
+    @cameras.setter
+    def cameras(self, value: list[ExternalCamera]) -> None:
+        main_window = getattr(self.app, "main_window", None)
+        for camera in self._cameras:
+            with contextlib.suppress(RuntimeError):
+                camera.changed.disconnect(self.on_cameras_changed)
+            if main_window is not None and camera not in value:
+                camera.close_dock(main_window)
+
+        self._cameras = value
+
+        for camera in self._cameras:
+            if camera.reader is None:
+                camera.open()
+            camera.changed.connect(self.on_cameras_changed)
+            camera.changed.emit()
+
+        self.on_cameras_changed()
+
+    def on_cameras_changed(self) -> None:
+        main_window = getattr(self.app, "main_window", None)
+        if main_window is not None:
+            for camera in self._cameras:
+                camera.sync_dock(main_window)
+        self.changed.emit()
+
+    def add_overlay(self, painter: OverlayPainter) -> None:
+        if painter not in self._overlays:
+            self._overlays.append(painter)
+
+    def remove_overlay(self, painter: OverlayPainter) -> None:
+        if painter in self._overlays:
+            self._overlays.remove(painter)
+
+    def detected_videos(self) -> list[Path] | None:
+        return self._detected_videos
+
+    def _make_camera(self, path: Path) -> ExternalCamera:
+        cam = ExternalCamera()
+        cam.video_path = str(path)
+        return cam
+
+    def on_recording_loaded(self, recording: NeonRecording) -> None:
+        rec_path = Path(self.recording._rec_dir)
+        self._detected_videos = sorted(
+            path
+            for suffix in VIDEO_SUFFIXES
+            for path in rec_path.glob(f"recording_*{suffix}")
+            if path.with_suffix(".time").exists()
+        )
+
+        known = {c.video_path for c in self._cameras}
+        added = [
+            self._make_camera(path)
+            for path in self._detected_videos
+            if str(path) not in known
+        ]
+        if added:
+            self.cameras = self._cameras + added
+            logger.info(
+                f"ExternalCameraPlugin: found {len(added)} new stream(s): "
+                f"{', '.join(c.name for c in added)}"
+            )
+        else:
+            self.cameras = self._cameras
+
+        vw = self.app.main_window.video_widget
+        if not getattr(self, "_signals_connected", False):
+            vw.mouse_pressed.connect(self.on_mouse_pressed)
+            vw.mouse_moved.connect(self.on_mouse_moved)
+            vw.mouse_released.connect(self.on_mouse_released)
+            self._signals_connected = True
+
+        self._shortcut_h = QShortcut(QKeySequence("Shift+H"), self.app.main_window)
+        self._shortcut_h.activated.connect(self.previous_frame)
+
+        self._shortcut_l = QShortcut(QKeySequence("Shift+L"), self.app.main_window)
+        self._shortcut_l.activated.connect(self.next_frame)
+
+    def on_disabled(self) -> None:
+        main_window = getattr(self.app, "main_window", None)
+        if main_window is not None:
+            for camera in self._cameras:
+                camera.close_dock(main_window)
+
+        if getattr(self, "_signals_connected", False):
+            try:
+                vw = self.app.main_window.video_widget
+                vw.mouse_pressed.disconnect(self.on_mouse_pressed)
+                vw.mouse_moved.disconnect(self.on_mouse_moved)
+                vw.mouse_released.disconnect(self.on_mouse_released)
+            except Exception:
+                pass  # ruff: ignore
+            self._signals_connected = False
+
+        if getattr(self, "_shortcut_h", None):
+            self._shortcut_h.setEnabled(False)
+            self._shortcut_h.deleteLater()
+            self._shortcut_h = None
+
+        if getattr(self, "_shortcut_l", None):
+            self._shortcut_l.setEnabled(False)
+            self._shortcut_l.deleteLater()
+            self._shortcut_l = None
+
+    def render(self, painter: QPainter, time_in_recording: int) -> None:
+        self._last_rendered_time = time_in_recording
+        for camera in self._cameras:
+            if camera.display_mode == DisplayMode.DOCKED:
+                self._render_docked(camera, time_in_recording)
+            elif camera.display_mode == DisplayMode.PIP:
+                self._render_pip(painter, camera, time_in_recording)
+
+    def _render_docked(self, camera: ExternalCamera, time_in_recording: int) -> None:
+        if camera._label is None:
+            return
+
+        res = camera.current_image(time_in_recording)
+        if not res:
+            return
+        idx, img = res
+
+        label_size = camera._label.size()
+        if label_size.width() <= 0 or label_size.height() <= 0:
+            return
+
+        state = (
+            idx,
+            label_size,
+            camera.opacity,
+            camera.rotation,
+            camera.scale,
+        )
+        if state == camera._dock_state:
+            return
+        camera._dock_state = state
+
+        pixmap = QPixmap(label_size)
+        pixmap.fill(Qt.GlobalColor.transparent)
+
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        painter.setOpacity(camera.opacity)
+
+        img_aspect = img.width() / img.height()
+        label_aspect = label_size.width() / label_size.height()
+        if img_aspect > label_aspect:
+            base_w = label_size.width()
+            base_h = base_w / img_aspect
+        else:
+            base_h = label_size.height()
+            base_w = base_h * img_aspect
+
+        cx, cy = label_size.width() / 2, label_size.height() / 2
+        painter.translate(cx, cy)
+        painter.rotate(camera.rotation)
+        painter.scale(camera.scale, camera.scale)
+        painter.translate(-cx, -cy)
+
+        rect = QRectF(cx - base_w / 2, cy - base_h / 2, base_w, base_h)
+        painter.drawImage(rect, img)
+
+        if self._overlays:
+            painter.translate(rect.topLeft())
+            for overlay in self._overlays:
+                overlay(painter, base_w, base_h, time_in_recording, camera.name)
+
+        painter.end()
+        camera._label.setPixmap(pixmap)
+
+    def _render_pip(
+        self, painter: QPainter, camera: ExternalCamera, time_in_recording: int
+    ) -> None:
+        res = camera.current_image(time_in_recording)
+        if not res:
+            return
+        _, img = res
+
+        sw, sh = self.recording.scene.width, self.recording.scene.height
+        base_th = sh / 3.0
+        th = base_th * camera.scale
+        tw = th * (img.width() / img.height())
+
+        x = (
+            (sw - tw - camera.offset_x * sw)
+            if camera.anchor_right
+            else (camera.offset_x * sw)
+        )
+        y = (
+            (sh - th - camera.offset_y * sh)
+            if camera.anchor_bottom
+            else (camera.offset_y * sh)
+        )
+        rect = QRectF(x, y, tw, th)
+        camera.last_rect = rect
+
+        painter.save()
+        painter.setOpacity(camera.opacity)
+
+        if camera.rotation != 0.0:
+            cx, cy = rect.center().x(), rect.center().y()
+            painter.translate(cx, cy)
+            painter.rotate(camera.rotation)
+            painter.translate(-cx, -cy)
+
+        painter.drawImage(rect, img)
+
+        if self._mouse_mode != ModifyDirection.NONE and self._drag_camera == camera:
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(QColor("#6D7BE0"), 4))
+            painter.drawRect(rect)
+        elif self._drag_camera == camera:
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(QColor(255, 255, 255), 2))
+            painter.drawRect(rect)
+
+        if self._overlays:
+            painter.translate(rect.topLeft())
+            for overlay in self._overlays:
+                overlay(painter, tw, th, time_in_recording, camera.name)
+
+        painter.restore()
+
+    def _event_pos(self, vw, event):
+        return (
+            vw.map_point(event.position())
+            if hasattr(event, "position")
+            else vw.map_point(event.pos())
+        )
+
+    def _visible_cameras(self) -> list[ExternalCamera]:
+        return [
+            c
+            for c in self._cameras
+            if c.display_mode != DisplayMode.OFF and len(c.timestamps) > 0
+        ]
+
+    def _hit_test(self, pos) -> ExternalCamera | None:
+        for camera in reversed(self._visible_cameras()):
+            if camera.display_mode == DisplayMode.PIP and camera.last_rect:
+                t = QTransform()
+                cx, cy = camera.last_rect.center().x(), camera.last_rect.center().y()
+                t.translate(cx, cy)
+                t.rotate(camera.rotation)
+                t.translate(-cx, -cy)
+                poly = t.map(camera.last_rect)
+                if poly.containsPoint(pos, Qt.FillRule.WindingFill):
+                    return camera
+        return None
+
+    def on_mouse_pressed(self, event):
+        pos = self._event_pos(self.app.main_window.video_widget, event)
+        camera = self._hit_test(pos)
+        if camera:
+            self._drag_camera = camera
+            self._drag_start_pos = pos
+            self._start_geometry = camera.last_rect
+            self._start_rotation = camera.rotation
+            self._start_scale = camera.scale
+            self.on_hover(event)
+            event.accept()
+
+    def on_mouse_moved(self, event):
+        if event.buttons() == Qt.MouseButton.LeftButton:
+            self.on_drag(event)
+        else:
+            self.on_hover(event)
+
+    def on_mouse_released(self, event):
+        self._mouse_mode = ModifyDirection.NONE
+        self._drag_start_pos = None
+        self._drag_camera = None
+        self.app.main_window.video_widget.unsetCursor()
+        self.changed.emit()
+
+    def on_hover(self, event):
+        vw = self.app.main_window.video_widget
+        pos = self._event_pos(vw, event)
+
+        camera = self._drag_camera or self._hit_test(pos)
+        if not camera or not camera.last_rect:
+            self._mouse_mode = ModifyDirection.NONE
+            vw.unsetCursor()
+            vw.update()
+            return
+
+        margin = max(30, camera.last_rect.width() * 0.15)
+        t = QTransform()
+        cx, cy = camera.last_rect.center().x(), camera.last_rect.center().y()
+        t.translate(cx, cy)
+        t.rotate(camera.rotation)
+        t.translate(-cx, -cy)
+
+        near_corner = False
+        for corner in (
+            camera.last_rect.topLeft(),
+            camera.last_rect.topRight(),
+            camera.last_rect.bottomLeft(),
+            camera.last_rect.bottomRight(),
+        ):
+            screen_c = t.map(corner)
+            if math.hypot(pos.x() - screen_c.x(), pos.y() - screen_c.y()) < margin:
+                near_corner = True
+                break
+
+        if near_corner:
+            self._mouse_mode = ModifyDirection.CORNER
+            vw.setCursor(Qt.CursorShape.CrossCursor)
+        else:
+            self._mouse_mode = ModifyDirection.MOVE
+            vw.setCursor(Qt.CursorShape.SizeAllCursor)
+
+        if self._drag_camera is None:
+            self._drag_camera = camera
+        vw.update()
+
+    def on_drag(self, event):
+        camera = self._drag_camera
+        if (
+            camera is None
+            or self._mouse_mode == ModifyDirection.NONE
+            or not self._drag_start_pos
+        ):
+            return
+
+        vw = self.app.main_window.video_widget
+        pos = self._event_pos(vw, event)
+
+        sw, sh = self.recording.scene.width, self.recording.scene.height
+
+        if self._mouse_mode == ModifyDirection.MOVE:
+            dx = pos.x() - self._drag_start_pos.x()
+            dy = pos.y() - self._drag_start_pos.y()
+
+            camera.offset_x += -dx / sw if camera.anchor_right else dx / sw
+            camera.offset_y += -dy / sh if camera.anchor_bottom else dy / sh
+
+            self._drag_start_pos = pos
+
+        elif self._mouse_mode == ModifyDirection.CORNER:
+            center = self._start_geometry.center()
+            cx, cy = center.x(), center.y()
+
+            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                angle1 = math.degrees(
+                    math.atan2(
+                        self._drag_start_pos.y() - cy, self._drag_start_pos.x() - cx
+                    )
+                )
+                angle2 = math.degrees(math.atan2(pos.y() - cy, pos.x() - cx))
+                diff = (angle2 - angle1 + 180) % 360 - 180
+                camera.rotation = (self._start_rotation + diff + 180) % 360 - 180
+            else:
+                transform = QTransform()
+                transform.translate(cx, cy)
+                transform.rotate(self._start_rotation)
+                transform.translate(-cx, -cy)
+
+                inverted, invertible = transform.inverted()
+                if invertible:
+                    local_pos = inverted.map(pos)
+                    local_start = inverted.map(self._drag_start_pos)
+
+                    dist_start = math.hypot(local_start.x() - cx, local_start.y() - cy)
+                    dist_current = math.hypot(local_pos.x() - cx, local_pos.y() - cy)
+
+                    if dist_start > 0:
+                        camera.scale = max(
+                            0.1, self._start_scale * dist_current / dist_start
+                        )
+
+        self.changed.emit()
+        vw.update()
+
+    def _step_frame(self, forward: bool) -> None:
+        visible = self._visible_cameras()
+        if not visible:
+            return
+
+        ts_array = visible[0].timestamps
+        if len(ts_array) == 0:
+            return
+
+        if forward:
+            idx = int(np.searchsorted(ts_array, self._last_rendered_time, side="right"))
+            target_idx = min(len(ts_array) - 1, idx)
+        else:
+            idx = int(np.searchsorted(ts_array, self._last_rendered_time))
+            target_idx = max(0, idx - 1)
+
+        self.app.seek_to(int(ts_array[target_idx]))
+
+    @action
+    @action_params(compact=True, icon=QIcon.fromTheme("media-seek-backward"))
     def previous_frame(self):
-        if not hasattr(self, "external_camera"):
-            return
-        ts_array = self.external_camera.timestamps
-        if len(ts_array) == 0:
-            return
-
-        current_time = getattr(self, "_last_rendered_time", 0)
-
-        idx = int(np.searchsorted(ts_array, current_time))
-        target_idx = max(0, idx - 1)
-
-        self.app.seek_to(int(ts_array[target_idx]))
+        self._step_frame(forward=False)
 
     @action
-    @action_params(
-        compact=True,
-        icon=QIcon.fromTheme("media-seek-forward"),
-    )
+    @action_params(compact=True, icon=QIcon.fromTheme("media-seek-forward"))
     def next_frame(self):
-        if not hasattr(self, "external_camera"):
-            return
-        ts_array = self.external_camera.timestamps
-        if len(ts_array) == 0:
-            return
-
-        current_time = getattr(self, "_last_rendered_time", 0)
-
-        idx = int(np.searchsorted(ts_array, current_time, side="right"))
-        target_idx = min(len(ts_array) - 1, idx)
-
-        self.app.seek_to(int(ts_array[target_idx]))
+        self._step_frame(forward=True)
