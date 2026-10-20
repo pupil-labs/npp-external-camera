@@ -359,6 +359,7 @@ class ExternalCameraPlugin(Plugin):
         self._cameras: list[ExternalCamera] = []
         self._detected_videos: list[Path] | None = None
         self._overlays: list[OverlayPainter] = []
+        self._overlay_revision = 0
 
         self._mouse_mode = ModifyDirection.NONE
         self._drag_start_pos = None
@@ -416,6 +417,11 @@ class ExternalCameraPlugin(Plugin):
     def remove_overlay(self, painter: OverlayPainter) -> None:
         if painter in self._overlays:
             self._overlays.remove(painter)
+            self.invalidate_overlays()
+
+    def invalidate_overlays(self) -> None:
+        """Mark cached dock pixmaps stale after an overlay's content changes."""
+        self._overlay_revision += 1
 
     def detected_videos(self) -> list[Path] | None:
         return self._detected_videos
@@ -515,6 +521,7 @@ class ExternalCameraPlugin(Plugin):
             camera.opacity,
             camera.rotation,
             camera.scale,
+            self._overlay_revision,
         )
         if state == camera._dock_state:
             return
